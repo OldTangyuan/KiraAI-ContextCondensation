@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, List, Optional
 
-from core.plugin import logger
+from core.plugin import get_logger
 from core.provider import LLMRequest
 from core.agent.message import OpenAIMessage
 
@@ -34,6 +34,7 @@ from .context_cache import (
     msg_text,
 )
 
+logger = get_logger('context_condensation.compressor', 'blue')
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
@@ -91,7 +92,7 @@ SELF_COMPRESS_PROMPT = """以下对话摘要内容过长，需要进一步压缩
 EMERGENCY_PROMPT = """以下是一段过长且未经整理的对话历史。由于上下文即将溢出，
 请一次性将其压缩为一条高密度摘要。
 保留：关键事实、决定、人名、数字、日期、时间线、未完成的任务。
-可以牺牲措辞细节，优先保证信息不丢失。
+可以牺牲措辞细节，优先保证信息不丢失，且以较新的信息为主。
 
 只输出摘要文本。
 
@@ -188,15 +189,20 @@ class CompressionEngine:
     # ---- layer 0: grouping + compression ----------------------------------------
 
     def plan_layer1_groups(
-        self, cache: ContextCache, growth_rounds: List[CachedRound]
+        self,
+        cache: ContextCache,
+        rounds: List[CachedRound],
+        complete_only: bool = False,
     ) -> List[CompressionGroup]:
-        """Assign ungrouped growth rounds to layer-1 groups by accumulated chars.
+        """Assign ungrouped rounds to layer-1 groups by accumulated chars.
 
-        Rounds already assigned to a group are skipped. Mutates the cache:
-        sets round.compression_group and marks rounds STATUS_COMPRESSING.
-        Returns the newly created groups.
+        Short rounds are batched together; only an over-long round forms a
+        singleton group. With ``complete_only`` (background mode) a partial
+        trailing group is left ungrouped so future rounds can still batch
+        into it; the injection cycle passes complete_only=False to group
+        whatever remains.
         """
-        ungrouped = [r for r in growth_rounds if r.compression_group is None]
+        ungrouped = [r for r in rounds if r.compression_group is None]
         if not ungrouped:
             return []
 
@@ -223,12 +229,15 @@ class CompressionEngine:
             current_chars = 0
 
         for r in ungrouped:
-            # A single over-long round forms its own group (§4.2)
             if current and current_chars + r.total_chars > self._max_chars_per_group:
                 flush()
             current.append(r)
             current_chars += r.total_chars
-        flush()
+            # A full group (or a single over-long round) is sealed immediately
+            if complete_only and current_chars >= self._max_chars_per_group:
+                flush()
+        if not complete_only:
+            flush()
         return created
 
     async def compress_group(self, cache: ContextCache, group: CompressionGroup) -> bool:
@@ -334,24 +343,37 @@ class CompressionEngine:
 
     # ---- final summary -------------------------------------------------------------
 
-    async def build_final_summary(self, cache: ContextCache) -> str:
-        """Merge the previous final summary with all unmerged top summaries (§4.4).
+    async def build_final_summary(self, cache: ContextCache, covered_ids: set) -> str:
+        """Merge the previous final summary with this cycle's top summaries (§4.4).
 
-        This is the only place where an old summary and newly compressed
-        summaries are combined. The result is stored in the "final" group so
-        it persists across requests and restarts.
+        A top group is consumable when every round it traces to is either in
+        ``covered_ids`` (this cycle's growth) or no longer in the cache at all
+        (deleted by a previous cycle). Char-batched groups spanning the
+        growth/anchor boundary therefore unblock as soon as their remaining
+        rounds slide into the growth zone — while tops covering still-anchored
+        rounds stay unmerged so nothing appears both as summary and original.
+        Consumed groups and their subtrees are DELETED after their round
+        coverage is flattened (deduplicated) into the final summary's
+        source_rounds — nothing pre-compression piles up.
         """
         tops = cache.unmerged_tops()
-        old_final = cache.find_group(FINAL_GROUP_ID)
+        consumable: List[tuple] = []  # (group, traced_round_indices)
+        for g in tops:
+            if not g.summary_text:
+                continue
+            traced = cache.trace_summary_to_rounds(g.group_id)
+            if traced and all(
+                ri in covered_ids or cache.get_round_by_index(ri) is None
+                for ri in traced
+            ):
+                consumable.append((g, traced))
 
+        old_final = cache.find_group(FINAL_GROUP_ID)
         parts: List[str] = []
         if old_final is not None and old_final.summary_text:
             parts.append(old_final.summary_text)
-        new_sources: List[str] = []
-        for g in tops:  # cache order = creation order = chronological
-            if g.summary_text:
-                parts.append(g.summary_text)
-                new_sources.append(g.group_id)
+        for g, _ in consumable:  # cache order = creation order = chronological
+            parts.append(g.summary_text)
 
         if not parts:
             return ""
@@ -385,11 +407,17 @@ class CompressionEngine:
         if old_final is None:
             old_final = CompressionGroup(group_id=FINAL_GROUP_ID, layer=99)
             cache.add_group(old_final)
-        # Append new sources to the existing chain — never reference our own
-        # group id (that would make trace_summary_to_rounds recurse forever).
-        old_final.source_groups = list(old_final.source_groups) + new_sources
+        # Flat traceability: a single deduplicated list of every covered index
+        old_final.source_rounds = list(dict.fromkeys(
+            list(old_final.source_rounds)
+            + [ri for _, traced in consumable for ri in traced]
+        ))
+        old_final.source_groups = []
         old_final.summary_text = text
         old_final.compressed = True
+        # Consumed groups (and their subtrees) are deleted — replacement done
+        for g, _ in consumable:
+            cache.delete_group_tree(g.group_id)
         return text
 
     # ---- emergency collapse (§4.5.2) -------------------------------------------------
@@ -451,15 +479,20 @@ class CompressionEngine:
             cache.add_group(old_final)
         # Preserve the previous trace chain; append this batch's direct rounds.
         old_final.source_rounds = list(old_final.source_rounds) + included
-        # Consume groups fully covered by this collapse so they are never
-        # merged into the final summary a second time.
+        old_final.source_groups = []
+        # Delete groups fully covered by this collapse (subtrees included) so
+        # they are never merged into the final summary a second time. Rounds
+        # no longer cached count as covered (same boundary rule as cycles).
         included_set = set(included)
-        for g in cache.groups:
-            if g.group_id == FINAL_GROUP_ID or g.group_id in old_final.source_groups:
+        for g in list(cache.groups):
+            if g.group_id == FINAL_GROUP_ID:
                 continue
             traced = cache.trace_summary_to_rounds(g.group_id)
-            if traced and all(ri in included_set for ri in traced):
-                old_final.source_groups.append(g.group_id)
+            if traced and all(
+                ri in included_set or cache.get_round_by_index(ri) is None
+                for ri in traced
+            ):
+                cache.delete_group_tree(g.group_id)
         old_final.summary_text = text
         old_final.compressed = True
         return text, included

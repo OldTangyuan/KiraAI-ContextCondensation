@@ -19,11 +19,13 @@ import json
 import re
 from typing import Any, List, Optional
 
-from core.plugin import logger
+from core.plugin import get_logger
 from core.provider import LLMRequest
 from core.agent.message import OpenAIMessage
 
 from .context_cache import msg_get, msg_text
+
+logger = get_logger('context_condensation.preprocessor', 'blue')
 
 SUMMARIZE_PROMPT = """请简洁地总结以下内容。
 保留所有关键事实、数字、名称和结论。
@@ -35,8 +37,9 @@ SUMMARIZE_PROMPT = """请简洁地总结以下内容。
 {content}
 """
 
-# Matches [Image: ...] and [图片描述: ...] blocks (DESIGN §6.3)
-_IMAGE_DESC_PATTERN = re.compile(r"\[(?:Image|图片描述)[:：]\s*(.*?)\]", re.DOTALL)
+# Matches [Image: ...], [Image ...] (space, no colon — seen in production
+# data) and [图片描述: ...] blocks (DESIGN §6.3)
+_IMAGE_DESC_PATTERN = re.compile(r"\[(?:Image|图片描述)[:：]?\s*(.+?)\]", re.DOTALL)
 
 _CONDENSED_SUFFIX = "（已压缩）"
 # Cap LLM input size for a single preprocessing call

@@ -110,7 +110,7 @@
             "tool_result_max_chars": {
                 "type": "integer",
                 "name": "Tool result max chars",
-                "default": 2000,
+                "default": 1500,
                 "hint": "Tool results longer than this will be summarized during preprocessing.",
                 "locales": {
                     "zh": {
@@ -182,7 +182,7 @@
             "debug_log": {
                 "type": "switch",
                 "name": "Debug logging",
-                "default": false,
+                "default": true,
                 "hint": "Log detailed compression pipeline info for debugging.",
                 "locales": {
                     "zh": {

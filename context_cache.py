@@ -23,7 +23,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.plugin import logger
+from core.plugin import get_logger
+
+logger = get_logger('context_condensation.context_cache', 'blue')
 
 # Round status state machine
 STATUS_ACTIVE = "active"            # In req.messages, original text kept
@@ -33,10 +35,10 @@ STATUS_ARCHIVED = "archived"        # Historical record, never in req.messages
 
 FINAL_GROUP_ID = "final"
 
-# Hygiene cap: how many archived round records to retain in the cache file.
-# Archived rounds are pure traceability metadata (their content is gone), so
-# pruning the oldest ones loses nothing but unbounded file growth.
-MAX_ARCHIVED_KEPT = 200
+# Bumped whenever preprocessing logic changes (e.g. regex fixes). On load, a
+# version mismatch resets is_preprocessed so rounds are re-processed with the
+# current logic instead of being stuck with a stale "no change" marker.
+PREPROCESS_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -166,26 +168,14 @@ class ContextCache:
                             "content": msg_text(msg_get(m, "content", ""))})
         return out
 
-    def _prune_archived(self) -> None:
-        """Cap archived round records; rebuild the fingerprint index after pruning."""
-        archived = [r for r in self._rounds if r.status == STATUS_ARCHIVED]
-        excess = len(archived) - MAX_ARCHIVED_KEPT
-        if excess <= 0:
-            return
-        doomed = {id(r) for r in archived[:excess]}
-        self._rounds = [r for r in self._rounds if id(r) not in doomed]
-        self._fingerprint_index = {
-            r.fingerprint: i for i, r in enumerate(self._rounds) if r.fingerprint
-        }
-
     def save(self, sid: str) -> None:
         path = self._cache_path(sid)
         with self._save_lock:
-            self._prune_archived()
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 data = {
                     "anchor_size": self._anchor_size,
+                    "preprocess_version": PREPROCESS_VERSION,
                     "next_round_index": self._next_round_index,
                     "next_group_index": self._next_group_index,
                     "rounds": [
@@ -243,11 +233,17 @@ class ContextCache:
         # anchor_size comes from the live config, not the file: the user may
         # have changed it in WebUI since the cache was written.
         self._next_round_index = data.get("next_round_index", 0)
+        preprocess_stale = data.get("preprocess_version", 1) != PREPROCESS_VERSION
         self._next_group_index = data.get("next_group_index", 0)
 
         self._rounds = []
         self._fingerprint_index.clear()
         for rd in data.get("rounds", []):
+            if rd.get("s") in (STATUS_COMPRESSED, STATUS_ARCHIVED):
+                # Migration: covered rounds carry no content, only metadata —
+                # drop them. Traceability lives in the final group's flat
+                # source_rounds list.
+                continue
             r = CachedRound(
                 round_index=rd["i"],
                 total_chars=rd.get("c", 0),
@@ -260,6 +256,16 @@ class ContextCache:
                 messages=list(rd.get("m", [])),
                 condensed_messages=(list(rd["cm"]) if rd.get("cm") else None),
             )
+            # Hygiene: never keep an identical duplicate of messages in
+            # condensed_messages (preprocessing that changed nothing)
+            if r.condensed_messages == r.messages:
+                r.condensed_messages = None
+            if preprocess_stale:
+                # Preprocessing logic changed since this cache was written:
+                # re-process with the current version (fixes e.g. image
+                # descriptions stuck with a stale no-change marker).
+                r.is_preprocessed = False
+                r.condensed_messages = None
             self._rounds.append(r)
             if r.fingerprint:
                 self._fingerprint_index[r.fingerprint] = len(self._rounds) - 1
@@ -385,31 +391,66 @@ class ContextCache:
     def archive_absent(self, present: List[CachedRound]) -> List[CachedRound]:
         """Handle rounds that no longer appear in req.messages.
 
-        Compressed rounds are simply archived (framework truncated them; their
-        info lives in the summary). Uncompressed rounds that still have their
-        message content are KEPT tracked and returned, so the compression
-        pipeline can still absorb them into the summary instead of losing the
-        information. Only content-less rounds are archived outright.
+        Uncompressed rounds that still have their message content are KEPT
+        tracked and returned, so the compression pipeline can still absorb
+        them into the summary instead of losing the information. Content-less
+        rounds are DELETED outright — once covered by the summary, raw content
+        is never kept around.
 
         Returns the list of vanished-but-still-compressible rounds.
         """
         present_ids = {r.round_index for r in present}
         vanished_compressible: List[CachedRound] = []
-        for r in self._rounds:
+        deleted = False
+        for r in list(self._rounds):
             if r.round_index in present_ids:
                 continue
-            if r.status == STATUS_COMPRESSED:
-                r.status = STATUS_ARCHIVED
+            if r.status in (STATUS_COMPRESSED, STATUS_ARCHIVED):
+                # Legacy states (pre-deletion-era caches): drop entirely
+                self._rounds.remove(r)
+                deleted = True
             elif r.status in (STATUS_ACTIVE, STATUS_COMPRESSING):
                 if r.messages:
                     vanished_compressible.append(r)
                 else:
                     logger.warning(
                         f"[context_condensation] Round {r.round_index} vanished from "
-                        f"context with no cached content; archiving"
+                        f"context with no cached content; dropping"
                     )
-                    r.status = STATUS_ARCHIVED
+                    self._rounds.remove(r)
+                    deleted = True
+        if deleted:
+            self._fingerprint_index = {
+                r.fingerprint: i for i, r in enumerate(self._rounds) if r.fingerprint
+            }
         return vanished_compressible
+
+    def delete_rounds(self, round_indices: List[int]) -> None:
+        """Fully remove rounds from the cache (called once the final summary
+        covers them — pre-compression content is discarded, not archived)."""
+        doomed = set(round_indices)
+        if not doomed:
+            return
+        self._rounds = [r for r in self._rounds if r.round_index not in doomed]
+        self._fingerprint_index = {
+            r.fingerprint: i for i, r in enumerate(self._rounds) if r.fingerprint
+        }
+
+    def delete_group_tree(self, group_id: str) -> None:
+        """Delete a group and its whole source_group subtree (called once the
+        final summary has absorbed them; the final summary keeps a flat list
+        of covered round indices for traceability)."""
+        doomed: set = set()
+        stack = [group_id]
+        while stack:
+            gid = stack.pop()
+            if gid in doomed or gid == FINAL_GROUP_ID:
+                continue
+            doomed.add(gid)
+            g = self.find_group(gid)
+            if g is not None:
+                stack.extend(g.source_groups)
+        self._groups = [g for g in self._groups if g.group_id not in doomed]
 
     # ---- round queries ---------------------------------------------------------
 
@@ -420,16 +461,6 @@ class ContextCache:
     @staticmethod
     def uncompressed_of(present: List[CachedRound]) -> List[CachedRound]:
         return [r for r in present if r.status in (STATUS_ACTIVE, STATUS_COMPRESSING)]
-
-    @staticmethod
-    def covered_of(present: List[CachedRound]) -> List[CachedRound]:
-        return [r for r in present if r.status in (STATUS_COMPRESSED, STATUS_ARCHIVED)]
-
-    def has_covered_rounds(self) -> bool:
-        """Whether ANY cached round is covered by the final summary."""
-        return any(
-            r.status in (STATUS_COMPRESSED, STATUS_ARCHIVED) for r in self._rounds
-        )
 
     def growth_of(self, uncompressed: List[CachedRound]) -> List[CachedRound]:
         """Compression candidates: uncompressed rounds outside the anchor tail."""
@@ -500,6 +531,16 @@ class ContextCache:
         if final is not None and final.compressed:
             return final.summary_text
         return ""
+
+    def adopt_final_summary(self, text: str) -> None:
+        """Adopt a summary chunk found in framework memory (e.g. written by a
+        previous run whose cache file was lost) as the final summary."""
+        final = self.find_group(FINAL_GROUP_ID)
+        if final is None:
+            final = CompressionGroup(group_id=FINAL_GROUP_ID, layer=99)
+            self.add_group(final)
+        final.summary_text = text
+        final.compressed = True
 
     def unmerged_tops(self) -> List[CompressionGroup]:
         """Compressed groups not yet merged into a parent (excluding the final summary)."""

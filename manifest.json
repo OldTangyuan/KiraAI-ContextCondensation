@@ -1,11 +1,15 @@
 {
     "display_name": "Context Condensation",
-    "plugin_id": "context_condensation",
-    "version": "0.2.0",
-    "author": "",
+    "plugin_id": "KiraAI-ContextCondensation",
+    "version": "0.5.0",
+    "author": "Old_tangyuan",
     "description": "Layered context compression with KV-cache-friendly design. Pre-compresses conversation history in a background cache and injects a single summary block when the context window reaches the threshold, keeping recent rounds as-is.",
-    "repo": null,
-    "tags": ["context", "compression", "performance"],
+    "repo": "https://github.com/OldTangyuan/KiraAI-ContextCondensation",
+    "tags": [
+        "context",
+        "compression",
+        "performance"
+    ],
     "core_version": ">=2.6.1",
     "locales": {
         "zh": {
