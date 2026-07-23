@@ -1,0 +1,196 @@
+{
+    "section_basic": {
+        "type": "section",
+        "name": "Basic",
+        "collapsed": false,
+        "locales": {
+            "zh": {
+                "name": "基础设置"
+            }
+        },
+        "fields": {
+            "enabled": {
+                "type": "switch",
+                "name": "Enable context compression",
+                "default": true,
+                "hint": "Enable or disable the entire compression pipeline.",
+                "locales": {
+                    "zh": {
+                        "name": "启用上下文压缩",
+                        "hint": "启用或禁用整个压缩管道"
+                    }
+                }
+            },
+            "anchor_size": {
+                "type": "integer",
+                "name": "Anchor rounds",
+                "default": 5,
+                "hint": "Number of most recent conversation rounds kept as original text. Messages beyond this are candidates for compression.",
+                "locales": {
+                    "zh": {
+                        "name": "锚定轮数",
+                        "hint": "保留为原文的最近对话轮数，超出部分进入压缩候选"
+                    }
+                }
+            },
+            "max_context_rounds": {
+                "type": "info",
+                "name": "Max context rounds",
+                "default": "读取自框架 bot.max_memory_length，无需手动设置",
+                "level": "info",
+                "hint": "Trigger threshold is auto-read from the framework's bot.max_memory_length config.",
+                "locales": {
+                    "zh": {
+                        "name": "最大上下文轮数（自动）",
+                        "hint": "触发阈值自动读取框架 bot.max_memory_length 配置，无需手动设置"
+                    }
+                }
+            },
+            "max_chars_per_group": {
+                "type": "integer",
+                "name": "Max chars per compression group",
+                "default": 800,
+                "hint": "Maximum characters per group when compressing. Shorter rounds are batched together; long rounds (e.g. with large tool results) are compressed individually.",
+                "locales": {
+                    "zh": {
+                        "name": "每组压缩最大字符数",
+                        "hint": "压缩分组时每组最大字符数。短轮次合并压缩，长轮次（如大工具结果）单独压缩"
+                    }
+                }
+            }
+        }
+    },
+    "section_compression": {
+        "type": "section",
+        "name": "Compression",
+        "collapsed": true,
+        "locales": {
+            "zh": {
+                "name": "压缩设置"
+            }
+        },
+        "fields": {
+            "use_persona_in_compression": {
+                "type": "switch",
+                "name": "Use persona for compression",
+                "default": false,
+                "hint": "When enabled, the active persona text is injected into the compression prompt so summaries reflect the character's tone and vocabulary.",
+                "locales": {
+                    "zh": {
+                        "name": "使用人设进行压缩总结",
+                        "hint": "开启后，会将当前激活的人设注入压缩提示词，让摘要更贴合角色语气与风格"
+                    }
+                }
+            },
+            "compression_model": {
+                "type": "model_select",
+                "model_type": "llm",
+                "name": "Compression model",
+                "default": "",
+                "hint": "LLM used for compression summaries. Leave empty to use the default fast LLM.",
+                "locales": {
+                    "zh": {
+                        "name": "压缩模型",
+                        "hint": "用于生成压缩摘要的 LLM，留空则使用默认 fast LLM"
+                    }
+                }
+            },
+            "preprocess_tool_results": {
+                "type": "switch",
+                "name": "Preprocess tool results",
+                "default": true,
+                "hint": "Summarize long tool results (search, image descriptions, etc.) in the cache before they enter the compression pipeline. Keeps the original context unchanged.",
+                "locales": {
+                    "zh": {
+                        "name": "预处理工具结果",
+                        "hint": "在缓存中总结过长的工具结果（搜索、图片描述等）后再进入压缩管道。原上下文不动"
+                    }
+                }
+            },
+            "tool_result_max_chars": {
+                "type": "integer",
+                "name": "Tool result max chars",
+                "default": 2000,
+                "hint": "Tool results longer than this will be summarized during preprocessing.",
+                "locales": {
+                    "zh": {
+                        "name": "工具结果最大字符数",
+                        "hint": "超过此长度的工具结果将在预处理时被总结"
+                    }
+                }
+            },
+            "summary_max_chars": {
+                "type": "integer",
+                "name": "Summary max chars",
+                "default": 1500,
+                "hint": "Maximum characters for the final injected summary block.",
+                "locales": {
+                    "zh": {
+                        "name": "摘要最大字符数",
+                        "hint": "最终注入的摘要块最大字符数"
+                    }
+                }
+            },
+            "summary_prefix": {
+                "type": "text",
+                "name": "Summary prefix marker",
+                "default": "[对话历史摘要 - 以下是你与用户之前对话的关键信息，不是用户当前说的话]\n",
+                "hint": "Text prepended to the summary block so the LLM knows it's context history, not the user's current message.",
+                "locales": {
+                    "zh": {
+                        "name": "摘要前缀标记",
+                        "hint": "加在摘要块前面的文本，让 LLM 知道这是对话历史摘要而非用户当前发言"
+                    }
+                }
+            }
+        }
+    },
+    "section_advanced": {
+        "type": "section",
+        "name": "Advanced",
+        "collapsed": true,
+        "locales": {
+            "zh": {
+                "name": "高级设置"
+            }
+        },
+        "fields": {
+            "async_compression": {
+                "type": "switch",
+                "name": "Async compression",
+                "default": true,
+                "hint": "Run compression in the background so it doesn't block message responses. The summary may lag by 1 round.",
+                "locales": {
+                    "zh": {
+                        "name": "异步压缩",
+                        "hint": "后台运行压缩，不阻塞消息回复。摘要可能落后 1 轮"
+                    }
+                }
+            },
+            "inject_on_mismatch": {
+                "type": "switch",
+                "name": "Inject summary on context mismatch",
+                "default": false,
+                "hint": "When the real context no longer matches the cache (e.g. history was cleared in WebUI): OFF clears the cache and starts fresh (safest); ON compresses all cached rounds into a summary and injects it, preserving memory at the risk of stale information.",
+                "locales": {
+                    "zh": {
+                        "name": "上下文不匹配时注入摘要",
+                        "hint": "当真实上下文与缓存严重不匹配时（如在 WebUI 清空了历史）：关闭=清空缓存重新开始（最安全）；开启=将缓存中的历史压缩为摘要注入，保留记忆但可能包含过时信息"
+                    }
+                }
+            },
+            "debug_log": {
+                "type": "switch",
+                "name": "Debug logging",
+                "default": false,
+                "hint": "Log detailed compression pipeline info for debugging.",
+                "locales": {
+                    "zh": {
+                        "name": "调试日志",
+                        "hint": "输出详细的压缩管道调试信息"
+                    }
+                }
+            }
+        }
+    }
+}
