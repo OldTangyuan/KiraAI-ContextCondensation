@@ -134,7 +134,7 @@
             "summary_prefix": {
                 "type": "text",
                 "name": "Summary prefix marker",
-                "default": "[对话历史摘要 - 以下是你与用户之前对话的关键信息，不是用户当前说的话]\n",
+                "default": "[对话历史摘要 - 以下是你与用户之前对话的关键信息，不是用户当前说的话，同时摘要可能有损，不一定准确]\n",
                 "hint": "Text prepended to the summary block so the LLM knows it's context history, not the user's current message.",
                 "locales": {
                     "zh": {
