@@ -384,6 +384,194 @@ def test_current_user_text_excludes_persist_false(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Injection cycle: self-contained timing fix
+# ---------------------------------------------------------------------------
+
+
+class _CycleStub:
+    """A ContextCondensationPlugin stripped to what _run_injection_cycle needs.
+
+    Reuses the REAL ``_run_injection_cycle`` method (bound from the plugin
+    class) but stubs every external interaction (LLM, framework write,
+    persistence, background tasks) so the cycle's timing logic can be tested
+    in isolation.
+    """
+
+    def __init__(self, tmp_path, scripted_llm):
+        self._tmp_path = Path(tmp_path)
+        self._debug = False
+        self._preprocess_tools = True
+        self._max_chars_per_group = 800
+        self._summary_max_chars = 50
+        self._summary_prefix = "[SUMMARY]\n"
+        self._tool_max_chars = 1500
+        self._background_tasks = {}
+        self._caches = {}
+        self.engine = CompressionEngine(FakeLLM(scripted_llm), summary_max_chars=50)
+        self.write_calls = []
+        self.saves = 0
+        self.background_started = 0
+        # Bind the real cycle implementation as a proper bound method so the
+        # leading ``self`` argument is supplied automatically.
+        from context_condensation.main import ContextCondensationPlugin
+
+        self._run_injection_cycle = types.MethodType(
+            ContextCondensationPlugin._run_injection_cycle, self
+        )
+
+    async def _make_engine(self):
+        return self.engine
+
+    async def _cancel_task(self, tasks, sid):
+        task = tasks.pop(sid, None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _preprocess_rounds(self, rounds, engine):
+        # No-op: rounds here have no oversized tool results.
+        for r in rounds:
+            r.is_preprocessed = True
+
+    async def _write_framework_memory(self, sid, summary_text, anchor_rounds):
+        self.write_calls.append((sid, summary_text, [r.round_index for r in anchor_rounds]))
+
+    async def _save(self, cache, sid):
+        self.saves += 1
+
+    def _start_background(self, sid):
+        self.background_started += 1
+
+    def _rebuild_messages(self, req, summary_text, kept_rounds):
+        req.messages = (
+            [{"role": "user", "content": self._summary_prefix + summary_text}]
+            + [m for r in kept_rounds for m in r.messages]
+        )
+
+
+def test_injection_cycle_compresses_synchronously(tmp_path):
+    """Threshold trigger compresses growth rounds itself, no background needed."""
+    stub = _CycleStub(tmp_path, ["G_A", "G_B", "FINAL_MERGE"])
+    cache = _new_cache(tmp_path, anchor=2)
+    stub._caches["sid1"] = cache
+    # 6 uncompressed rounds, anchor=2 -> growth zone holds 4
+    _sync_rounds(cache, 6, prefix="cyc")
+
+    class Req:
+        messages = None  # set by _rebuild_messages
+
+    req = Req()
+    req.messages = [m for r in cache.rounds for m in r.messages]
+
+    # Threshold: 6 uncompressed rounds, max_context_rounds effectively 4
+    stub._max_context_rounds = 4
+    uncompressed = cache.uncompressed_of(
+        [r for r in cache.rounds if r.status in ("active", "compressing")]
+    )
+    _run(stub._run_injection_cycle("sid1", cache, uncompressed, req, None))
+
+    # The cycle must have compressed + injected WITHOUT a prior background pass
+    assert len(stub.write_calls) == 1, f"write-through must happen, got {len(stub.write_calls)}"
+    _, summary, kept = stub.write_calls[0]
+    assert summary, f"final summary must be produced, got {summary!r}"
+    # Rebuilt messages begin with the summary chunk
+    assert req.messages, "req.messages must be rebuilt"
+    assert req.messages[0]["content"].startswith(stub._summary_prefix), (
+        f"summary missing from head: {req.messages[0]['content']!r}"
+    )
+    # Kept rounds = anchor tail only (2 rounds, 4 messages)
+    assert len(kept) == 2, f"expected 2 kept rounds, got {len(kept)}"
+    # Covered growth rounds deleted from cache
+    assert cache.total_rounds == 2, f"expected 2 rounds left, got {cache.total_rounds}"
+
+
+def test_injection_cycle_covers_partial_when_llm_fails(tmp_path):
+    """When the LLM fails on one group, the cycle still injects what IS ready
+    and never defers the whole turn (the window must not sit stale)."""
+    # One pre-compressed group covering rounds 0..1 (as if the background
+    # pipeline already finished it), plus fresh uncompressed rounds whose
+    # compression FAILS (FakeLLM fallback returns empty -> compress_group
+    # returns False -> those rounds stay uncovered). The ready group must
+    # still be injected this turn.
+    stub = _CycleStub(tmp_path, [])  # scripted empty -> fresh group fails
+    stub.engine = CompressionEngine(
+        FakeLLM(scripted=[], fallback=""), summary_max_chars=50
+    )
+    cache = _new_cache(tmp_path, anchor=2)
+    stub._caches["sid1"] = cache
+    # 6 rounds: anchor=2 -> growth zone = rounds 0..3. Mark rounds 0..1 as
+    # belonging to a ready compressed group; rounds 2..3 stay ungrouped and
+    # their compression FAILS (empty fallback) -> only 0..1 get covered.
+    _sync_rounds(cache, 6, prefix="pf")
+    cache.add_group(
+        CompressionGroup(
+            group_id="g_ready", layer=1, source_rounds=[0, 1],
+            summary_text="READY_SUMMARY", compressed=True,
+        )
+    )
+    cache._rounds[0].compression_group = "g_ready"
+    cache._rounds[1].compression_group = "g_ready"
+
+    class Req:
+        messages = None
+
+    req = Req()
+    req.messages = [m for r in cache.rounds for m in r.messages]
+    stub._max_context_rounds = 4
+    uncompressed = cache.uncompressed_of(
+        [r for r in cache.rounds if r.status in ("active", "compressing")]
+    )
+    _run(stub._run_injection_cycle("sid1", cache, uncompressed, req, None))
+
+    # The ready group's rounds MUST be covered and injected, regardless of the
+    # fresh rounds that failed to compress.
+    assert len(stub.write_calls) == 1, "write-through must still happen"
+    _, summary, kept = stub.write_calls[0]
+    assert summary, "summary from the ready group must be injected"
+    assert "READY_SUMMARY" in summary
+    # The fresh uncompressed rounds are NOT covered -> stay in kept
+    assert len(kept) >= 4, f"fresh rounds must stay in kept, got {len(kept)}"
+
+
+# ---------------------------------------------------------------------------
+# Background pending-work: frequent but NOT per-round
+# ---------------------------------------------------------------------------
+
+
+def test_has_pending_work_requires_pair_or_big_round(tmp_path):
+    from context_condensation.main import ContextCondensationPlugin
+
+    plugin = ContextCondensationPlugin.__new__(ContextCondensationPlugin)
+    plugin._max_chars_per_group = 800
+
+    # ONE small ungrouped growth round: NOT enough to trigger (avoid per-round
+    # compression storms) — needs a second round or a big round.
+    cache = _new_cache(tmp_path, anchor=2)
+    _sync_rounds(cache, 3, prefix="one")  # 3 rounds, anchor 2 -> growth holds 1
+    assert plugin._has_pending_work(cache) is False
+
+    # TWO small ungrouped growth rounds: trigger (they pair up).
+    cache2 = _new_cache(tmp_path, anchor=1)
+    _sync_rounds(cache2, 3, prefix="two")  # 3 rounds, anchor 1 -> growth holds 2
+    assert plugin._has_pending_work(cache2) is True
+
+    # A single HUGE round also triggers (its chars exceed the group cap).
+    cache3 = _new_cache(tmp_path, anchor=2)
+    cache3.sync(
+        [
+            {"role": "user", "content": "Q" * 900},
+            {"role": "assistant", "content": "A" * 900},
+        ]
+    )
+    _sync_rounds(cache3, 2, prefix="big")
+    # growth holds round 0 (the huge one) only -> its chars exceed 800
+    assert plugin._has_pending_work(cache3) is True
+
+
+# ---------------------------------------------------------------------------
 # Standalone runner (no pytest required)
 # ---------------------------------------------------------------------------
 
@@ -401,6 +589,9 @@ _ALL_TESTS = [
     test_final_summary_self_compress_when_over_cap,
     test_final_summary_hard_truncate_when_llm_still_long,
     test_current_user_text_excludes_persist_false,
+    test_injection_cycle_compresses_synchronously,
+    test_injection_cycle_covers_partial_when_llm_fails,
+    test_has_pending_work_requires_pair_or_big_round,
 ]
 
 
