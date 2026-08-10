@@ -533,20 +533,20 @@ class ContextCondensationPlugin(BasePlugin):
         req: LLMRequest,
         vanished: Optional[List[CachedRound]] = None,
     ) -> None:
-        """Compress the growth zone synchronously and inject the final summary.
+        """Compress the whole growth zone in ONE shot and inject the final summary.
 
-        This is the KEY timing fix: at the injection threshold the cycle is
-        SELF-CONTAINED. It cancels any in-flight background pass (so it cannot
-        race our cache mutation), then preprocesses + groups + compresses the
-        growth rounds itself. It NEVER defers a whole turn just because the
-        background pipeline has not caught up — the context window is already
-        full, so waiting would let the sliding window move several more rounds
-        before the summary is replaced.
+        Timing design: at the injection threshold the cycle is SELF-CONTAINED
+        and does a SINGLE LLM call for the final summary. It cancels any
+        in-flight background pass (so it cannot race our cache mutation), then
+        builds the final summary from [old final summary] + [every ready top
+        summary] + [raw content of the remaining growth rounds] in one merge
+        call. Nothing is pre-compressed group-by-group here — that is the
+        background pipeline's job. So final latency is exactly ONE LLM call,
+        whether or not the background caught up.
 
-        If the LLM is down and compression fails, only the rounds whose groups
-        are ready get replaced; the rest stay verbatim in the live context and
-        are picked up next cycle. The summary injection still happens for what
-        IS ready, so the window never sits stale.
+        The entire growth zone is replaced by the summary (it never defers a
+        whole turn). If the LLM is down, nothing is replaced this turn — the
+        window passes through and the next cycle retries.
         """
         growth = cache.growth_of(uncompressed)
         # Merge in vanished-but-cached rounds (chronological order)
@@ -567,55 +567,30 @@ class ContextCondensationPlugin(BasePlugin):
         if engine is None:
             return
 
-        # Synchronously prepare ALL growth rounds: preprocess oversized tool
-        # results / image descriptions, group by chars, compress each group.
-        # This is bounded — one pass over the growth zone, not an unbounded
-        # loop — so the hook still never stalls on a pile of retries.
-        if self._preprocess_tools:
-            try:
-                await self._preprocess_rounds(growth, engine)
-            except Exception as e:
-                logger.warning(
-                    f"[context_condensation] sid={sid} preprocess in cycle failed: {e}"
-                )
-        force_all = True  # cycle must seal every group so the window is freed
-        try:
-            engine.plan_layer1_groups(cache, growth, complete_only=not force_all)
-            await engine.compress_all_pending(cache)
-        except Exception as e:
-            logger.error(
-                f"[context_condensation] sid={sid} cycle compression failed: {e}"
-            )
+        # Preprocess oversized tool results / image descriptions in the CACHE
+        # (never the live context) so the serialized input stays compact. This
+        # is optional and best-effort — a failure must not block the cycle.
+        # Do NOT preprocess here: pre-processing is a background-pipeline
+        # optimization (it shrinks oversized tool results before they enter
+        # compression). At the injection threshold the goal is ONE shot — we
+        # fold the growth content into the final merge directly. Running
+        # per-round pre-processing here would fire an LLM call per oversized
+        # round, reintroducing the exact stall we are removing.
+        # Everything in the growth zone is replaced by the summary.
+        covered_ids = {r.round_index for r in growth}
 
-        # What is covered = growth rounds whose group compressed successfully.
-        # Rounds that failed (LLM down) stay in the live context verbatim.
-        def is_covered(r: CachedRound) -> bool:
-            if r.compression_group is None:
-                return False
-            g = cache.find_group(r.compression_group)
-            return g is not None and g.compressed
-
-        covered = [r for r in growth if is_covered(r)]
-        if not covered:
-            # LLM is down: nothing absorbable this turn. Keep the pipeline
-            # working and let the window pass through — next cycle retries.
-            self._start_background(sid)
-            await self._save(cache, sid)
-            logger.warning(
-                f"[context_condensation] sid={sid} cycle: nothing compressed "
-                f"(LLM unavailable); passing through uncompressed"
-            )
-            return
-        covered_ids = {r.round_index for r in covered}
-
-        await engine.merge_available_pairs(cache)
+        # ONE-shot final summary: old final + ready tops + raw growth content.
         summary_text = await engine.build_final_summary(cache, covered_ids=covered_ids)
         if not summary_text:
             self._start_background(sid)
             await self._save(cache, sid)
+            logger.warning(
+                f"[context_condensation] sid={sid} cycle: final summary failed "
+                f"(LLM unavailable); passing through uncompressed"
+            )
             return
 
-        # Kept = not-yet-ready growth rounds + the anchor tail (chronological)
+        # Kept = the anchor tail only (chronological)
         kept = [r for r in uncompressed if r.round_index not in covered_ids]
 
         # Write-through: framework memory becomes [summary fused into first
@@ -624,14 +599,14 @@ class ContextCondensationPlugin(BasePlugin):
         # The current request uses the compressed context immediately
         self._rebuild_messages(req, summary_text, kept)
 
-        # Cleanup: covered rounds are DELETED — their content lives in the
+        # Cleanup: all growth rounds are DELETED — their content lives in the
         # final summary now, keeping them would only bloat the cache.
-        cache.delete_rounds([r.round_index for r in covered])
+        cache.delete_rounds(list(covered_ids))
         await self._save(cache, sid)
 
         logger.info(
             f"[context_condensation] sid={sid} cycle done: compressed "
-            f"{len(covered)}/{len(growth)} growth rounds -> {len(summary_text)} chars, "
+            f"{len(covered_ids)} growth rounds in one pass -> {len(summary_text)} chars, "
             f"kept={len(kept)} rounds"
         )
 
@@ -665,16 +640,16 @@ class ContextCondensationPlugin(BasePlugin):
     def _has_pending_work(self, cache: ContextCache) -> bool:
         """Whether the pipeline has anything compressible right now.
 
-        Eager but NOT per-round: triggers when the growth zone has at least two
-        ungrouped rounds (so short rounds still pair up) or enough accumulated
-        chars to fill a group, or a pending/mergeable group exists. This keeps
-        the background pipeline warm — compression runs frequently — without
-        compressing a single round by itself.
+        Eager: ANY ungrouped growth-zone round (or pending/mergeable group)
+        triggers a background pass. Compression happens in the CACHE only and
+        never touches the live context, so the earlier it runs the better —
+        the injection cycle then finds ready groups instead of stalling on a
+        pile of LLM calls when the window is full. ``_background_pass`` still
+        batches short rounds (never compressing a single round by itself), so
+        this is frequent without being per-round.
         """
         growth = cache.growth_of(cache.tracked_rounds())
-        ungrouped = [r for r in growth if r.compression_group is None]
-        ungrouped_chars = sum(r.total_chars for r in ungrouped)
-        if len(ungrouped) >= 2 or ungrouped_chars >= self._max_chars_per_group:
+        if any(r.compression_group is None for r in growth):
             return True
         if any(g.layer == 1 and not g.compressed for g in cache.groups):
             return True
@@ -705,9 +680,10 @@ class ContextCondensationPlugin(BasePlugin):
         failing — the next turn retries).
 
         Grouping batches short rounds together (complete_only=True keeps a
-        partial tail ungrouped so future rounds join it). Once the tracked
-        round count approaches the cycle threshold, the tail is also sealed
-        (complete_only=False) so the injection cycle finds every group ready.
+        partial tail ungrouped so future rounds join it). A lone short round
+        stays ungrouped to wait for a partner; full char-batches and single
+        over-long rounds seal immediately. The injection cycle seals EVERYTHING
+        (complete_only=False), so at final time nothing is left ungrouped.
         """
         try:
             cache = self._caches.get(sid)
@@ -721,15 +697,23 @@ class ContextCondensationPlugin(BasePlugin):
                 growth = cache.growth_of(cache.tracked_rounds())
                 if growth and self._preprocess_tools:
                     await self._preprocess_rounds(growth, engine)
-                # Batch complete char-batches; near the threshold also seal the
-                # tail so the cycle finds every group ready.
-                near_threshold = len(cache.tracked_rounds()) >= self._max_context_rounds
-                if growth and any(r.compression_group is None for r in growth):
+                # Group with complete_only=True: short rounds batch together and
+                # a lone short round stays ungrouped to wait for a partner. Full
+                # char-batches (and single over-long rounds) seal immediately.
+                # The injection cycle seals EVERYTHING (complete_only=False),
+                # so at final time nothing is left ungrouped.
+                if growth:
                     progress += len(
-                        engine.plan_layer1_groups(
-                            cache, growth, complete_only=not near_threshold
-                        )
+                        engine.plan_layer1_groups(cache, growth, complete_only=True)
                     )
+                # Was there anything that would trigger an LLM call? If not, the
+                # no-progress exit below is "waiting for a partner", NOT an LLM
+                # failure — it must not arm the backoff throttle.
+                had_llm_work = any(
+                    g.layer == 1 and not g.compressed for g in cache.groups
+                ) or any(
+                    g.summary_text for g in cache.unmerged_tops()
+                )
                 pending_before = sum(
                     1 for g in cache.groups if g.layer == 1 and g.compressed
                 )
@@ -741,9 +725,11 @@ class ContextCondensationPlugin(BasePlugin):
                 if progress:
                     await self._save(cache, sid)
                 else:
-                    # No progress: typically the LLM is down. Remember when so
-                    # _start_background can throttle retries.
-                    self._last_background_fail[sid] = time.monotonic()
+                    if had_llm_work:
+                        # LLM calls were attempted and made no progress: the LLM
+                        # is likely down. Arm the backoff so the next turn does
+                        # not immediately retry.
+                        self._last_background_fail[sid] = time.monotonic()
                     break
             self._log_debug(f"sid={sid} background pipeline caught up")
         except asyncio.CancelledError:

@@ -359,6 +359,37 @@ def test_final_summary_hard_truncate_when_llm_still_long(tmp_path):
     assert len(summary) <= 55  # 50 * 1.1 hard cap
 
 
+def test_final_summary_single_llm_call(tmp_path):
+    """The final summary is built with ONE LLM call (the latency fix).
+
+    Even with several ready tops + raw covered rounds, build_final_summary
+    folds everything into a single merge call instead of merging pairwise
+    (which used to stall when the window was full of un-pre-compressed rounds).
+    """
+    cache = _new_cache(tmp_path)
+    _sync_rounds(cache, 6, prefix="onecall")  # rounds 0..5
+    llm = FakeLLM(["FINAL_RESULT"])
+    engine = CompressionEngine(llm, summary_max_chars=200)
+    # Two ready tops covering rounds 0..3
+    cache.add_group(
+        CompressionGroup(
+            group_id="g0", layer=1, source_rounds=[0, 1],
+            summary_text="TOP_A", compressed=True,
+        )
+    )
+    cache.add_group(
+        CompressionGroup(
+            group_id="g1", layer=1, source_rounds=[2, 3],
+            summary_text="TOP_B", compressed=True,
+        )
+    )
+    # Rounds 4,5 are covered but have NO group -> folded in as raw serialized
+    summary = _run(engine.build_final_summary(cache, covered_ids={0, 1, 2, 3, 4, 5}))
+    # Exactly one LLM call: the final merge.
+    assert len(llm.calls) == 1, f"expected 1 LLM call, got {len(llm.calls)}"
+    assert summary == "FINAL_RESULT"
+
+
 # ---------------------------------------------------------------------------
 # Plugin helper: current user text (persist filter)
 # ---------------------------------------------------------------------------
@@ -454,7 +485,7 @@ class _CycleStub:
 
 def test_injection_cycle_compresses_synchronously(tmp_path):
     """Threshold trigger compresses growth rounds itself, no background needed."""
-    stub = _CycleStub(tmp_path, ["G_A", "G_B", "FINAL_MERGE"])
+    stub = _CycleStub(tmp_path, ["FINAL_MERGE"])
     cache = _new_cache(tmp_path, anchor=2)
     stub._caches["sid1"] = cache
     # 6 uncompressed rounds, anchor=2 -> growth zone holds 4
@@ -488,15 +519,14 @@ def test_injection_cycle_compresses_synchronously(tmp_path):
     assert cache.total_rounds == 2, f"expected 2 rounds left, got {cache.total_rounds}"
 
 
-def test_injection_cycle_covers_partial_when_llm_fails(tmp_path):
-    """When the LLM fails on one group, the cycle still injects what IS ready
-    and never defers the whole turn (the window must not sit stale)."""
+def test_injection_cycle_replaces_whole_growth_zone(tmp_path):
+    """Even when the background didn't pre-compress, the cycle replaces the WHOLE
+    growth zone in one shot: ready summaries + raw rounds fold into a single
+    final summary, and nothing is deferred."""
     # One pre-compressed group covering rounds 0..1 (as if the background
-    # pipeline already finished it), plus fresh uncompressed rounds whose
-    # compression FAILS (FakeLLM fallback returns empty -> compress_group
-    # returns False -> those rounds stay uncovered). The ready group must
-    # still be injected this turn.
-    stub = _CycleStub(tmp_path, [])  # scripted empty -> fresh group fails
+    # pipeline finished it), plus fresh uncompressed rounds 2..3 whose raw
+    # content is folded directly into the final summary.
+    stub = _CycleStub(tmp_path, [])  # scripted empty -> final merge returns ""
     stub.engine = CompressionEngine(
         FakeLLM(scripted=[], fallback=""), summary_max_chars=50
     )
@@ -504,7 +534,7 @@ def test_injection_cycle_covers_partial_when_llm_fails(tmp_path):
     stub._caches["sid1"] = cache
     # 6 rounds: anchor=2 -> growth zone = rounds 0..3. Mark rounds 0..1 as
     # belonging to a ready compressed group; rounds 2..3 stay ungrouped and
-    # their compression FAILS (empty fallback) -> only 0..1 get covered.
+    # are folded in raw.
     _sync_rounds(cache, 6, prefix="pf")
     cache.add_group(
         CompressionGroup(
@@ -526,14 +556,14 @@ def test_injection_cycle_covers_partial_when_llm_fails(tmp_path):
     )
     _run(stub._run_injection_cycle("sid1", cache, uncompressed, req, None))
 
-    # The ready group's rounds MUST be covered and injected, regardless of the
-    # fresh rounds that failed to compress.
+    # The whole growth zone (rounds 0..3) is replaced in one pass.
     assert len(stub.write_calls) == 1, "write-through must still happen"
     _, summary, kept = stub.write_calls[0]
-    assert summary, "summary from the ready group must be injected"
+    assert summary, "a summary must be produced even when the merge returns empty"
     assert "READY_SUMMARY" in summary
-    # The fresh uncompressed rounds are NOT covered -> stay in kept
-    assert len(kept) >= 4, f"fresh rounds must stay in kept, got {len(kept)}"
+    # Kept = anchor tail only (rounds 4,5)
+    assert len(kept) == 2, f"expected anchor only in kept, got {len(kept)}"
+    assert cache.total_rounds == 2
 
 
 # ---------------------------------------------------------------------------
@@ -541,34 +571,76 @@ def test_injection_cycle_covers_partial_when_llm_fails(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_has_pending_work_requires_pair_or_big_round(tmp_path):
+def test_has_pending_work_eager_on_any_ungrouped(tmp_path):
     from context_condensation.main import ContextCondensationPlugin
 
     plugin = ContextCondensationPlugin.__new__(ContextCondensationPlugin)
     plugin._max_chars_per_group = 800
 
-    # ONE small ungrouped growth round: NOT enough to trigger (avoid per-round
-    # compression storms) — needs a second round or a big round.
+    # ANY ungrouped growth round triggers a background pass: compression runs
+    # in the cache only (no context impact), so the earlier the better — the
+    # injection cycle then finds ready groups instead of stalling.
     cache = _new_cache(tmp_path, anchor=2)
     _sync_rounds(cache, 3, prefix="one")  # 3 rounds, anchor 2 -> growth holds 1
-    assert plugin._has_pending_work(cache) is False
+    assert plugin._has_pending_work(cache) is True
 
-    # TWO small ungrouped growth rounds: trigger (they pair up).
-    cache2 = _new_cache(tmp_path, anchor=1)
-    _sync_rounds(cache2, 3, prefix="two")  # 3 rounds, anchor 1 -> growth holds 2
-    assert plugin._has_pending_work(cache2) is True
+    # A cache with NO ungrouped growth rounds and nothing pending -> False.
+    cache4 = _new_cache(tmp_path, anchor=2)
+    _sync_rounds(cache4, 2, prefix="idle")  # 2 rounds, anchor 2 -> growth empty
+    assert plugin._has_pending_work(cache4) is False
 
-    # A single HUGE round also triggers (its chars exceed the group cap).
-    cache3 = _new_cache(tmp_path, anchor=2)
-    cache3.sync(
-        [
-            {"role": "user", "content": "Q" * 900},
-            {"role": "assistant", "content": "A" * 900},
-        ]
+
+def test_background_no_backoff_when_waiting_for_partner(tmp_path):
+    """A lone short round (no LLM work) must NOT arm the retry backoff.
+
+    Otherwise the pass would set _last_background_fail and throttle retries
+    for 15s every time a single short round is waiting for a partner —
+    reintroducing the exact latency bug this fix removes.
+    """
+    from context_condensation.main import ContextCondensationPlugin
+
+    plugin = ContextCondensationPlugin.__new__(ContextCondensationPlugin)
+    plugin._debug = False
+    plugin._max_chars_per_group = 800
+    plugin._preprocess_tools = False
+    plugin._max_context_rounds = 10
+    plugin._background_tasks = {}
+    plugin._caches = {}
+    plugin._last_background_fail = {}
+    plugin._async_compression = True
+
+    cache = _new_cache(tmp_path, anchor=2)
+    _sync_rounds(cache, 3, prefix="wait")  # 3 rounds, anchor 2 -> growth holds 1
+    plugin._caches["sid_wait"] = cache
+
+    llm = _CountingLLM()
+    plugin._make_engine = _make_engine_async_factory(llm)
+
+    _run(plugin._background_pass("sid_wait"))
+
+    # No LLM call happened, and no backoff was armed.
+    assert llm.calls == 0, "lone short round must not trigger an LLM call"
+    assert "sid_wait" not in plugin._last_background_fail, (
+        "waiting for a partner must not arm backoff"
     )
-    _sync_rounds(cache3, 2, prefix="big")
-    # growth holds round 0 (the huge one) only -> its chars exceed 800
-    assert plugin._has_pending_work(cache3) is True
+
+
+class _CountingLLM:
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, req):
+        self.calls += 1
+        return _FakeResp("S")
+
+
+def _make_engine_async_factory(llm):
+    from context_condensation.compressor import CompressionEngine
+
+    async def _make():
+        return CompressionEngine(llm, summary_max_chars=50)
+
+    return _make
 
 
 # ---------------------------------------------------------------------------
@@ -588,10 +660,12 @@ _ALL_TESTS = [
     test_final_summary_within_cap,
     test_final_summary_self_compress_when_over_cap,
     test_final_summary_hard_truncate_when_llm_still_long,
+    test_final_summary_single_llm_call,
     test_current_user_text_excludes_persist_false,
     test_injection_cycle_compresses_synchronously,
-    test_injection_cycle_covers_partial_when_llm_fails,
-    test_has_pending_work_requires_pair_or_big_round,
+    test_injection_cycle_replaces_whole_growth_zone,
+    test_has_pending_work_eager_on_any_ungrouped,
+    test_background_no_backoff_when_waiting_for_partner,
 ]
 
 
