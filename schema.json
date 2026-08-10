@@ -45,8 +45,7 @@
                         "hint": "触发阈值自动读取框架 bot.max_memory_length 配置，无需手动设置"
                     }
                 }
-            },
-            "max_chars_per_group": {
+            },            "max_chars_per_group": {
                 "type": "integer",
                 "name": "Max chars per compression group",
                 "default": 800,
@@ -110,8 +109,7 @@
             "tool_result_max_chars": {
                 "type": "integer",
                 "name": "Tool result max chars",
-                "default": 1500,
-                "hint": "Tool results longer than this will be summarized during preprocessing.",
+                "default": 1500,                "hint": "Tool results longer than this will be summarized during preprocessing.",
                 "locales": {
                     "zh": {
                         "name": "工具结果最大字符数",
@@ -182,7 +180,7 @@
             "debug_log": {
                 "type": "switch",
                 "name": "Debug logging",
-                "default": true,
+                "default": false,
                 "hint": "Log detailed compression pipeline info for debugging.",
                 "locales": {
                     "zh": {

@@ -37,6 +37,7 @@ KV-cache design (§7):
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,19 +48,20 @@ from core.agent.message import OpenAIMessage
 from .context_cache import (
     CachedRound,
     ContextCache,
+    is_prompt,
     msg_get,
     msg_text,
 )
 from .compressor import CompressionEngine
 from .preprocessor import preprocess_round
 
-# Max seconds to wait for a running background compression before injecting (§9.3)
-_COMPRESS_WAIT_TIMEOUT = 30.0
-_COMPRESS_WAIT_INTERVAL = 0.5
 # Delay between a finished reply and the real-time cache re-sync
 _POST_REPLY_SYNC_DELAY = 1.0
 # Max iterations of one background pass (bounds retries when the LLM is down)
 _BACKGROUND_MAX_LOOPS = 4
+# Minimum seconds between background passes after a failed (no-progress) pass,
+# so a down LLM cannot trigger a retry storm every turn.
+_BACKGROUND_RETRY_DELAY = 15.0
 
 logger = get_logger('context_condensation.main', 'blue')
 
@@ -77,7 +79,7 @@ class ContextCondensationPlugin(BasePlugin):
         self._compression_model_id: str = comp.get("compression_model", "") or ""
         self._use_persona: bool = comp.get("use_persona_in_compression", False)
         self._preprocess_tools: bool = comp.get("preprocess_tool_results", True)
-        self._tool_max_chars: int = max(200, int(comp.get("tool_result_max_chars", 2000)))
+        self._tool_max_chars: int = max(200, int(comp.get("tool_result_max_chars", 1500)))
         self._summary_max_chars: int = max(200, int(comp.get("summary_max_chars", 1500)))
         self._summary_prefix: str = comp.get(
             "summary_prefix",
@@ -107,12 +109,57 @@ class ContextCondensationPlugin(BasePlugin):
         # Per-session lock: serializes hook executions of the same sid so two
         # concurrent requests can never run competing compression cycles.
         self._locks: Dict[str, asyncio.Lock] = {}
+        # Per-session monotonic timestamp of the last background pass that made
+        # no progress (LLM failures) — used to throttle retries.
+        self._last_background_fail: Dict[str, float] = {}
 
     # ---- lifecycle -------------------------------------------------------------
 
     async def initialize(self):
-        self._data_dir = Path(self.ctx.get_plugin_data_dir())
-        self._data_dir.mkdir(parents=True, exist_ok=True)
+        # get_plugin_data_dir() resolves via the caller's module to the active
+        # plugin_id; it can return None when plugin_mgr is unset or the module
+        # is not registered. Fall back to a stable path in that case.
+        base = None
+        try:
+            base = self.ctx.get_plugin_data_dir()
+        except Exception:
+            base = None
+        if base is None:
+            from core.utils.path_utils import get_data_path
+            base = get_data_path() / "plugin_data" / "context_condensation"
+        base = Path(base)
+        base.mkdir(parents=True, exist_ok=True)
+
+        # Cache continuity: plugin_id changed from "context_condensation" to
+        # "KiraAI-ContextCondensation" at some point, so the active plugin dir
+        # may be a fresh empty directory while real caches still live under the
+        # old name. Migrate once (only when the active dir has no caches yet).
+        active_caches = base / "caches"
+        legacy_caches = base.parent / "context_condensation" / "caches"
+        if (
+            legacy_caches != active_caches  # guard the fallback-path self-move case
+            and not list(active_caches.glob("*.json"))
+            and legacy_caches.exists()
+        ):
+            try:
+                active_caches.mkdir(parents=True, exist_ok=True)
+                for f in legacy_caches.glob("*.json"):
+                    try:
+                        f.replace(active_caches / f.name)
+                    except OSError as e:
+                        logger.warning(
+                            f"[context_condensation] Failed to migrate cache "
+                            f"{f.name}: {e}"
+                        )
+                migrated = len(list(active_caches.glob("*.json")))
+                logger.info(
+                    f"[context_condensation] Migrated {migrated} cache file(s) "
+                    f"from legacy plugin dir"
+                )
+            except OSError as e:
+                logger.warning(f"[context_condensation] Cache migration failed: {e}")
+
+        self._data_dir = base
         logger.info(
             f"[context_condensation] Initialized "
             f"(anchor={self._anchor_size}, threshold={self._max_context_rounds}, "
@@ -129,13 +176,17 @@ class ContextCondensationPlugin(BasePlugin):
                 if not task.done():
                     try:
                         await task
-                    except (asyncio.CancelledError, Exception):
+                    except asyncio.CancelledError:
                         pass
             tasks.clear()
         for sid, cache in list(self._caches.items()):
-            cache.save(sid)
+            try:
+                cache.save(sid)
+            except Exception:
+                pass  # best-effort persist during shutdown
         self._caches.clear()
         self._locks.clear()
+        self._last_background_fail.clear()
 
     # ---- helpers -----------------------------------------------------------------
 
@@ -199,8 +250,29 @@ class ContextCondensationPlugin(BasePlugin):
         )
 
     def _log_debug(self, msg: str) -> None:
+        # debug-level detail: only visible when the global log level is DEBUG.
         if self._debug:
-            logger.info(f"[context_condensation] {msg}")
+            logger.debug(f"[context_condensation] {msg}")
+
+    @staticmethod
+    def _current_user_text(req: LLMRequest) -> str:
+        """Join the current incoming user input from persist=True prompts.
+
+        The framework marks dynamic blocks (sessions/chat_env/time relocated
+        with ``dynamic_prompt_position="latest_user"`` and the
+        ``<system_reminder>`` wrapper) as ``persist=False`` — they are prompt
+        scaffolding, not the user's actual message, and must be excluded.
+        """
+        parts: List[str] = []
+        for p in getattr(req, "user_prompt", []) or []:
+            if not isinstance(p, object):
+                continue
+            if getattr(p, "persist", True) is False:
+                continue
+            text = (getattr(p, "content", "") or "").strip()
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
 
     def _get_lock(self, sid: str) -> asyncio.Lock:
         if sid not in self._locks:
@@ -299,9 +371,11 @@ class ContextCondensationPlugin(BasePlugin):
             await asyncio.to_thread(
                 self.ctx.session_mgr.write_memory, sid, chunks
             )
-        except Exception:
+        except Exception as e:
             # In-memory rebuild still happened; next cycle will retry the write
-            logger.exception(f"[context_condensation] sid={sid} write_memory failed")
+            logger.error(
+                f"[context_condensation] sid={sid} write_memory failed: {e}"
+            )
 
     # ---- main hook: ON_LLM_REQUEST ------------------------------------------------
 
@@ -324,9 +398,9 @@ class ContextCondensationPlugin(BasePlugin):
         try:
             async with self._get_lock(sid):
                 await self._process(sid, req)
-        except Exception:
-            logger.exception(
-                f"[context_condensation] sid={sid} hook failed; "
+        except Exception as e:
+            logger.error(
+                f"[context_condensation] sid={sid} hook failed: {e}; "
                 f"context passed through untouched"
             )
             req.messages = original_messages
@@ -340,7 +414,11 @@ class ContextCondensationPlugin(BasePlugin):
 
     async def _process(self, sid: str, req: LLMRequest) -> None:
         cache = self._get_cache(sid)
-        added, present, summary_present = self._sync_from_framework(cache, req.messages)
+        # Normalize: ephemeral Prompt scaffolding (persist=False dynamic blocks
+        # and any other plugin-injected Prompt) is not conversation history and
+        # must never enter the cache or be rebuilt into req.messages.
+        history = [m for m in req.messages if not is_prompt(m)]
+        added, present, summary_present = self._sync_from_framework(cache, history)
 
         # Severe mismatch (history cleared / framework reset) — §9.1
         if cache.detect_mismatch(present):
@@ -363,7 +441,10 @@ class ContextCondensationPlugin(BasePlugin):
             f"sid={sid} total={cache.total_rounds} present={len(present)} "
             f"uncompressed={len(uncompressed)} new={len(added)} vanished={len(vanished)}"
         )
-
+        if self._debug:
+            user_text = self._current_user_text(req)
+            if user_text:
+                self._log_debug(f"sid={sid} current user input: {user_text[:120]!r}")
         # Real-time persistence: the cache file tracks every new round
         if added:
             await self._save(cache, sid)
@@ -410,7 +491,11 @@ class ContextCondensationPlugin(BasePlugin):
             if session_mgr is None:
                 return
             # Avoid recreating a deleted session via fetch_memory's ensure logic
-            if session_mgr.get_memory_count(sid) <= 0:
+            try:
+                if session_mgr.get_memory_count(sid) <= 0:
+                    return
+            except Exception:
+                # Session was deleted in the meantime — nothing to sync.
                 return
             async with self._get_lock(sid):
                 cache = self._get_cache(sid)
@@ -427,8 +512,10 @@ class ContextCondensationPlugin(BasePlugin):
                     self._start_background(sid)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception(f"[context_condensation] sid={sid} post-reply sync error")
+        except Exception as e:
+            # A deleted session or transient session-manager error must not
+            # surface as a traceback flood.
+            logger.debug(f"[context_condensation] sid={sid} post-reply sync error: {e}")
 
     # ---- injection cycle (write-through) -----------------------------------------
 
@@ -561,6 +648,12 @@ class ContextCondensationPlugin(BasePlugin):
         if not self._async_compression:
             # Sync mode is handled lazily inside the injection cycle
             return
+        # Throttle: if the last pass made no progress (LLM down), wait out the
+        # backoff window before retrying so a dead provider cannot trigger a
+        # retry storm every single turn.
+        last_fail = self._last_background_fail.get(sid, 0.0)
+        if last_fail and (time.monotonic() - last_fail) < _BACKGROUND_RETRY_DELAY:
+            return
         self._background_tasks[sid] = asyncio.create_task(self._background_pass(sid))
 
     async def _background_pass(self, sid: str) -> None:
@@ -608,35 +701,45 @@ class ContextCondensationPlugin(BasePlugin):
                 if progress:
                     await self._save(cache, sid)
                 else:
+                    # No progress: typically the LLM is down. Remember when so
+                    # _start_background can throttle retries.
+                    self._last_background_fail[sid] = time.monotonic()
                     break
             self._log_debug(f"sid={sid} background pipeline caught up")
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception(f"[context_condensation] sid={sid} background pass error")
+        except Exception as e:
+            # Single-line error: a transient failure (LLM down, provider error)
+            # must not flood the log with a full traceback on every turn.
+            self._last_background_fail[sid] = time.monotonic()
+            logger.error(f"[context_condensation] sid={sid} background pass error: {e}")
 
     async def _wait_for_background(self, sid: str) -> None:
         """Give a running pipeline pass a bounded chance to settle.
 
-        Never cancels the task: a pass in flight is doing useful work that
-        the next turn will harvest (§9.3).
+        Never cancels the task and NEVER blocks the caller: this runs while the
+        per-session lock is held inside ``_process``, so a blocking wait here
+        would stall concurrent requests for the same session. We simply take
+        what the pass has produced so far; the next cycle harvests the rest
+        (§9.3).
         """
         task = self._background_tasks.get(sid)
         if task is None or task.done():
             return
-        self._log_debug(f"sid={sid} waiting for background compression...")
-        waited = 0.0
-        while not task.done() and waited < _COMPRESS_WAIT_TIMEOUT:
-            await asyncio.sleep(_COMPRESS_WAIT_INTERVAL)
-            waited += _COMPRESS_WAIT_INTERVAL
-        if not task.done():
-            self._log_debug(f"sid={sid} background pass still running; proceeding")
+        self._log_debug(f"sid={sid} background pass in flight; proceeding with ready work")
+        # Give the running task a single cheap yield so its just-completed
+        # frame can land before we read group state.
+        await asyncio.sleep(0)
 
     # ---- emergency collapse (§4.5.2) ------------------------------------------------
 
     def _start_emergency(self, sid: str) -> None:
         task = self._background_tasks.get(sid)
         if task is not None and not task.done():
+            return
+        # Throttle repeated emergency attempts just like background passes.
+        last_fail = self._last_background_fail.get(sid, 0.0)
+        if last_fail and (time.monotonic() - last_fail) < _BACKGROUND_RETRY_DELAY:
             return
         logger.warning(
             f"[context_condensation] sid={sid} cache piled up beyond "
@@ -685,8 +788,11 @@ class ContextCondensationPlugin(BasePlugin):
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception(f"[context_condensation] sid={sid} emergency collapse error")
+        except Exception as e:
+            self._last_background_fail[sid] = time.monotonic()
+            logger.error(
+                f"[context_condensation] sid={sid} emergency collapse error: {e}"
+            )
 
     # ---- mismatch handling (§9.1) ------------------------------------------------------
 
@@ -708,7 +814,7 @@ class ContextCondensationPlugin(BasePlugin):
                 f"[context_condensation] sid={sid} severe context mismatch; clearing cache"
             )
             cache.clear()
-            cache.sync(req.messages)
+            cache.sync([m for m in req.messages if not is_prompt(m)])
             await self._save(cache, sid)
             return
 

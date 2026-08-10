@@ -56,7 +56,8 @@ async def _summarize(content: str, llm) -> Optional[str]:
         summary = (response.text_response or "").strip()
         return summary or None
     except Exception as e:
-        logger.warning(f"[context_condensation] Preprocess summarization failed: {e}")
+        # Preprocessing is best-effort; a failing LLM must not spam the log.
+        logger.debug(f"[context_condensation] Preprocess summarization failed: {e}")
         return None
 
 
