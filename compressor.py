@@ -89,6 +89,18 @@ SELF_COMPRESS_PROMPT = """以下对话摘要内容过长，需要进一步压缩
 {summary}
 """
 
+FINAL_MERGE_PROMPT = """以下是一段对话历史的压缩片段（可能是先前生成的摘要，也可能是尚未压缩的原始对话内容）。
+请将它们合并/压缩为一条完整、简洁、信息密度高的最终摘要。
+保留：关键事实、决定、人名、数字、日期、时间线、未完成的任务。
+以较新的信息为主，但不要丢失重要的旧信息。
+去除冗余措辞，使用第三人称。
+
+只输出合并后的摘要文本，不要加任何前言。
+
+内容：
+{content}
+"""
+
 EMERGENCY_PROMPT = """以下是一段过长且未经整理的对话历史。由于上下文即将溢出，
 请一次性将其压缩为一条高密度摘要。
 保留：关键事实、决定、人名、数字、日期、时间线、未完成的任务。
@@ -381,20 +393,24 @@ class CompressionEngine:
     # ---- final summary -------------------------------------------------------------
 
     async def build_final_summary(self, cache: ContextCache, covered_ids: set) -> str:
-        """Merge the previous final summary with this cycle's top summaries (§4.4).
+        """Produce the next final summary in ONE LLM call (§4.4).
 
-        A top group is consumable when every round it traces to is either in
-        ``covered_ids`` (this cycle's growth) or no longer in the cache at all
-        (deleted by a previous cycle). Char-batched groups spanning the
-        growth/anchor boundary therefore unblock as soon as their remaining
-        rounds slide into the growth zone — while tops covering still-anchored
-        rounds stay unmerged so nothing appears both as summary and original.
-        Consumed groups and their subtrees are DELETED after their round
-        coverage is flattened (deduplicated) into the final summary's
-        source_rounds — nothing pre-compression piles up.
+        Inputs, in chronological order:
+          - the previous final summary (if any),
+          - every compressed top group whose traced rounds are all covered by
+            this cycle (or already deleted),
+          - the raw content of covered rounds that have NO compressed group yet
+            (they were not pre-compressed in time — they are folded directly
+            into the final summary so nothing in the freed window is lost).
+
+        All three are joined into a single ``FINAL_MERGE_PROMPT`` call. This is
+        the timing fix: the final summary no longer re-compresses stale groups
+        one by one (which caused a long stall when the window was full of
+        un-pre-compressed rounds). Total final cost = ONE LLM call, regardless
+        of how much the background pipeline had or had not caught up.
         """
         tops = cache.unmerged_tops()
-        consumable: List[tuple] = []  # (group, traced_round_indices)
+        consumable: List[CompressionGroup] = []
         for g in tops:
             if not g.summary_text:
                 continue
@@ -403,35 +419,54 @@ class CompressionEngine:
                 ri in covered_ids or cache.get_round_by_index(ri) is None
                 for ri in traced
             ):
-                consumable.append((g, traced))
+                consumable.append(g)
+
+        parts: List[str] = []
 
         old_final = cache.find_group(FINAL_GROUP_ID)
-        parts: List[str] = []
         if old_final is not None and old_final.summary_text:
             parts.append(old_final.summary_text)
-        for g, _ in consumable:  # cache order = creation order = chronological
+        for g in consumable:  # cache order = creation order = chronological
             parts.append(g.summary_text)
+
+        # Fold in covered rounds that have NO compressed summary yet. They are
+        # serialized inline so a pre-compression gap cannot lose them — and
+        # this keeps the window freed in one pass even if the background
+        # pipeline never caught up.
+        for ri in sorted(covered_ids):
+            r = cache.get_round_by_index(ri)
+            if r is None:
+                continue
+            if r.compression_group is not None:
+                # Its group was already handled above (compressed) or failed
+                # (uncompressed group) — only fold it in if the group truly
+                # produced no summary.
+                g = cache.find_group(r.compression_group)
+                if g is not None and g.summary_text:
+                    continue
+            serialized = self.serialize_round(r)
+            if serialized:
+                parts.append(serialized)
 
         if not parts:
             return ""
 
-        while len(parts) > 1:
-            next_parts: List[str] = []
-            for i in range(0, len(parts), 2):
-                if i + 1 < len(parts):
-                    merged = await self._merge_texts(parts[i], parts[i + 1])
-                    if merged is None:
-                        # Merge failed; keep both parts for a later retry.
-                        next_parts.extend([parts[i], parts[i + 1]])
-                    else:
-                        next_parts.append(merged)
-                else:
-                    next_parts.append(parts[i])
-            if len(next_parts) == len(parts):
-                break  # no progress; use what we have rather than looping forever
-            parts = next_parts
-
-        text = parts[0] if len(parts) == 1 else "\n".join(parts)
+        # Single-shot merge: one LLM call produces the next final summary.
+        content = "\n".join(parts)[:GROUP_INPUT_MAX_CHARS]
+        if not content.strip():
+            return ""
+        try:
+            text = await self._llm_chat(FINAL_MERGE_PROMPT.format(content=content))
+        except Exception as e:
+            logger.warning(f"[context_condensation] Final merge failed: {e}")
+            text = ""
+        if not text:
+            # Merge produced nothing (LLM down / empty reply): fall back to the
+            # concatenated parts so the cycle still injects the ready summaries
+            # rather than deferring the whole window.
+            text = parts[0] if len(parts) == 1 else "\n".join(parts)
+            if not text:
+                return ""
 
         # Bound the final summary length: self-compress when over the soft cap,
         # hard-truncate as a fallback so it can never grow unbounded.
@@ -440,16 +475,15 @@ class CompressionEngine:
         if old_final is None:
             old_final = CompressionGroup(group_id=FINAL_GROUP_ID, layer=99)
             cache.add_group(old_final)
-        # Flat traceability: a single deduplicated list of every covered index
-        old_final.source_rounds = list(dict.fromkeys(
-            list(old_final.source_rounds)
-            + [ri for _, traced in consumable for ri in traced]
-        ))
+        # Covered rounds are DELETED right after the cycle, so their indices in
+        # source_rounds would point at nothing — keeping them only makes the
+        # cache file grow without bound. Drop the trace list entirely.
+        old_final.source_rounds = []
         old_final.source_groups = []
         old_final.summary_text = text
         old_final.compressed = True
         # Consumed groups (and their subtrees) are deleted — replacement done
-        for g, _ in consumable:
+        for g in consumable:
             cache.delete_group_tree(g.group_id)
         return text
 
@@ -514,8 +548,10 @@ class CompressionEngine:
         if old_final is None:
             old_final = CompressionGroup(group_id=FINAL_GROUP_ID, layer=99)
             cache.add_group(old_final)
-        # Preserve the previous trace chain; append this batch's direct rounds.
-        old_final.source_rounds = list(old_final.source_rounds) + included
+        # Same as the cycle path: collapsed rounds are deleted afterwards, so
+        # their indices would dangle — drop the trace list to keep the cache
+        # file bounded.
+        old_final.source_rounds = []
         old_final.source_groups = []
         # Delete groups fully covered by this collapse (subtrees included) so
         # they are never merged into the final summary a second time. Rounds

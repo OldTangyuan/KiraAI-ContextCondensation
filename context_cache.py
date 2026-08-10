@@ -333,6 +333,14 @@ class ContextCache:
                 max_gid = max(max_gid, int(gid[1:]))
         self._next_group_index = max(self._next_group_index, max_gid + 1)
 
+        # Migration: the final group's source_rounds/source_groups used to
+        # accumulate across every cycle (covering already-deleted rounds). Those
+        # indices point at nothing now — drop them so old cache files shrink.
+        final = self.find_group(FINAL_GROUP_ID)
+        if final is not None:
+            final.source_rounds = []
+            final.source_groups = []
+
     def clear(self) -> None:
         """Wipe all state (used on severe context mismatch with inject_on_mismatch=false)."""
         self._rounds.clear()
