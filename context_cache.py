@@ -67,6 +67,18 @@ def msg_text(content: Any) -> str:
     return str(content)
 
 
+def is_prompt(msg: Any) -> bool:
+    """True when ``msg`` is a framework Prompt object rather than a real message.
+
+    Prompt objects (core.prompt_manager.Prompt) carry no ``role`` field, so
+    ``msg_get`` returns None for them; real messages (dict / OpenAIMessage)
+    always have a non-None role. Such objects must never enter the cache:
+    they are ephemeral prompt scaffolding (e.g. ``persist=False`` dynamic
+    blocks), not conversation history.
+    """
+    return msg_get(msg, "role", None) is None
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -218,18 +230,49 @@ class ContextCache:
                 tmp_path = path.with_suffix(".tmp")
                 tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 tmp_path.replace(path)
-            except OSError:
-                logger.warning(f"[context_condensation] Failed to save cache for {sid}")
+            except Exception:
+                # Broad guard: serialization errors (e.g. an unserializable
+                # message object) must never crash the event loop.
+                logger.warning(
+                    f"[context_condensation] Failed to save cache for {sid}"
+                )
 
     def load(self, sid: str) -> bool:
         path = self._cache_path(sid)
         if not path.exists():
             return False
+        # Read under the same lock save() uses: save runs in a worker thread
+        # (asyncio.to_thread) and could otherwise be mid-write while we read,
+        # surfacing a half-written file.
+        with self._save_lock:
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                logger.warning(
+                    f"[context_condensation] Cannot read cache for {sid}; starting fresh"
+                )
+                return False
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            # Corrupt/empty file: refuse to crash, rebuild from scratch.
+            logger.warning(
+                f"[context_condensation] Corrupt cache for {sid}; starting fresh"
+            )
             return False
 
+        try:
+            self._deserialize(data)
+        except Exception:
+            logger.warning(
+                f"[context_condensation] Invalid cache content for {sid}; starting fresh"
+            )
+            self.clear()
+            return False
+        return True
+
+    def _deserialize(self, data: dict) -> None:
+        """Populate cache state from a parsed cache dict (shared by load)."""
         # anchor_size comes from the live config, not the file: the user may
         # have changed it in WebUI since the cache was written.
         self._next_round_index = data.get("next_round_index", 0)
@@ -289,7 +332,6 @@ class ContextCache:
             if gid and gid[0] in "gp" and gid[1:].isdigit():
                 max_gid = max(max_gid, int(gid[1:]))
         self._next_group_index = max(self._next_group_index, max_gid + 1)
-        return True
 
     def clear(self) -> None:
         """Wipe all state (used on severe context mismatch with inject_on_mismatch=false)."""
@@ -306,6 +348,9 @@ class ContextCache:
 
         Returns (newly_added_rounds, present_rounds_in_req_order).
         """
+        # Opportunistic hygiene: sealed empty groups (no content, no summary)
+        # are dead records that would otherwise accumulate forever.
+        self.gc_orphan_groups()
         candidates = self._parse_into_rounds(messages)
         added: List[CachedRound] = []
         present: List[CachedRound] = []
@@ -357,6 +402,11 @@ class ContextCache:
         rounds: List[CachedRound] = []
         current: Optional[CachedRound] = None
         for msg in messages:
+            # Ephemeral Prompt scaffolding (e.g. persist=False dynamic blocks)
+            # is not conversation history: never cache, fingerprint, or rebuild
+            # from it. Real messages always carry a role.
+            if is_prompt(msg):
+                continue
             if msg_get(msg, "role") == "user":
                 if current is not None:
                     current.calc_chars()
@@ -573,3 +623,27 @@ class ContextCache:
 
         walk(group_id)
         return result
+
+    def gc_orphan_groups(self) -> int:
+        """Drop dead group records that would otherwise accumulate forever.
+
+        The real growth vector is groups that were sealed with NO content:
+        ``compress_group`` marks a content-less round group ``compressed`` with
+        an empty ``summary_text``, and such a group is never merged into a
+        parent (pairwise merges skip empty summaries) nor deleted — it lingers
+        as a permanent empty top. A sealed empty group is dropped when no other
+        group references it and it is not the final summary. Returns the number
+        of groups dropped.
+        """
+        children = {sg for g in self._groups for sg in g.source_groups}
+        keep = [
+            g for g in self._groups
+            if g.group_id == FINAL_GROUP_ID
+            or g.group_id in children
+            or g.summary_text  # live top (pending merge) or compressed with content
+            or not g.compressed  # still-pending layer-1 group: keep for retry
+        ]
+        dropped = len(self._groups) - len(keep)
+        if dropped:
+            self._groups = keep
+        return dropped

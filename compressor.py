@@ -111,6 +111,10 @@ GROUP_INPUT_MAX_CHARS = 12000
 # Per-call timeout: a hung LLM becomes a retriable failure instead of
 # blocking the chat reply forever.
 LLM_CALL_TIMEOUT = 120.0
+# How much the final summary may overshoot summary_max_chars before the hard
+# truncation kicks in (LLM summaries are approximate; a little slack avoids
+# chopping a perfectly good summary over a handful of characters).
+SUMMARY_HARD_CAP_FACTOR = 1.1
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +298,10 @@ class CompressionEngine:
 
     async def _merge_texts(self, a: str, b: str) -> Optional[str]:
         try:
+            # Trim oversized inputs so a bloated old summary cannot blow up the
+            # merge call or the model's context window.
+            a = a[:GROUP_INPUT_MAX_CHARS]
+            b = b[:GROUP_INPUT_MAX_CHARS]
             text = await self._llm_chat(
                 COMPRESS_PAIR_PROMPT.format(a_content=a, b_content=b)
             )
@@ -301,6 +309,35 @@ class CompressionEngine:
         except Exception as e:
             logger.warning(f"[context_condensation] Pair merge failed: {e}")
             return None
+
+    async def _cap_summary(self, text: str) -> str:
+        """Bound a final summary to ~``summary_max_chars``.
+
+        Three layers, in order:
+          1. Accept as-is when within the soft cap (summary_max_chars).
+          2. Self-compress via the LLM when over the soft cap.
+          3. HARD-truncate when still over the cap (self-compress failed, or
+             the LLM returned something still too long) — the summary can never
+             grow unbounded, even if the LLM is completely down.
+
+        Truncation keeps the head and marks it, since summaries are head-heavy
+        (recency is preserved by the head-anchored injection order).
+        """
+        hard_cap = int(self._summary_max_chars * SUMMARY_HARD_CAP_FACTOR)
+        if len(text) <= hard_cap:
+            return text
+        if len(text) > self._summary_max_chars:
+            try:
+                compressed = await self._llm_chat(SELF_COMPRESS_PROMPT.format(summary=text))
+                if compressed:
+                    text = compressed
+            except Exception as e:
+                logger.warning(f"[context_condensation] Self-compression failed: {e}")
+        if len(text) <= hard_cap:
+            return text
+        if len(text) > self._summary_max_chars:
+            text = text[: self._summary_max_chars].rstrip() + "…"
+        return text
 
     async def merge_available_pairs(self, cache: ContextCache) -> int:
         """Pair-merge unmerged top summaries, same layer only (§4.2).
@@ -396,13 +433,9 @@ class CompressionEngine:
 
         text = parts[0] if len(parts) == 1 else "\n".join(parts)
 
-        if len(text) > self._summary_max_chars:
-            try:
-                compressed = await self._llm_chat(SELF_COMPRESS_PROMPT.format(summary=text))
-                if compressed:
-                    text = compressed
-            except Exception as e:
-                logger.warning(f"[context_condensation] Self-compression failed: {e}")
+        # Bound the final summary length: self-compress when over the soft cap,
+        # hard-truncate as a fallback so it can never grow unbounded.
+        text = await self._cap_summary(text)
 
         if old_final is None:
             old_final = CompressionGroup(group_id=FINAL_GROUP_ID, layer=99)
@@ -472,6 +505,10 @@ class CompressionEngine:
             merged = await self._merge_texts(old_final_text, text)
             if merged:
                 text = merged
+
+        # Bound the merged result so the emergency path cannot grow unbounded
+        # either (self-compress + hard truncate).
+        text = await self._cap_summary(text)
 
         old_final = cache.find_group(FINAL_GROUP_ID)
         if old_final is None:
