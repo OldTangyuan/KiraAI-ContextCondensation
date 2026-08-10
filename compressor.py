@@ -254,7 +254,7 @@ class CompressionEngine:
             # group so it does not block the pipeline forever.
             group.summary_text = ""
             group.compressed = True
-            logger.warning(
+            logger.debug(
                 f"[context_condensation] Group {group.group_id} has no content; sealed"
             )
             return True

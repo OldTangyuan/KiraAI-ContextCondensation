@@ -181,11 +181,11 @@
                 "type": "switch",
                 "name": "Debug logging",
                 "default": false,
-                "hint": "Log detailed compression pipeline info for debugging.",
+                "hint": "When enabled, detailed compression pipeline progress is logged at INFO level (visible in the console even with the default log level). Leave off for a quiet install.",
                 "locales": {
                     "zh": {
                         "name": "调试日志",
-                        "hint": "输出详细的压缩管道调试信息"
+                        "hint": "开启后以 INFO 级别输出详细的压缩管道进度（默认日志级别下可见）。关闭则保持安静"
                     }
                 }
             }
