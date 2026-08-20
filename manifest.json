@@ -11,6 +11,8 @@
         "performance"
     ],
     "core_version": ">=2.6.1",
+    "icon": "day.svg",
+    "icon-dark": "night.svg",
     "locales": {
         "zh": {
             "display_name": "上下文压缩",
